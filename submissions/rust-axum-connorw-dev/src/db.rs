@@ -147,6 +147,14 @@ impl Db {
         result
     }
 
+    /// For the health check: a read succeeds, and the writer thread is still there to take writes.
+    pub fn check(&self) -> rusqlite::Result<()> {
+        if self.writes.is_closed() {
+            return Err(aborted("writer thread has stopped"));
+        }
+        self.read(|db| db.query_row("SELECT 1", [], |_| Ok(())))
+    }
+
     /// Queues `change` for the writer thread and resolves once the transaction holding it has
     /// committed, so the change is on disk before the caller answers anyone.
     pub async fn write<T: Send + 'static>(
@@ -183,10 +191,17 @@ fn group_commit(db: Connection, mut queue: mpsc::Receiver<Job>) {
             batch.clear(); // a dropped job drops its reply channel, so its caller gets an error
             continue;
         }
-        // A failed statement rolls back only itself, and a panicking job loses only its own reply.
-        let finish: Vec<_> =
-            batch.drain(..).filter_map(|job| catch_unwind(AssertUnwindSafe(|| job(&db))).ok()).collect();
-        // Some errors (I/O, disk full) roll back the whole transaction, so check it is still open.
+        // A failed statement usually rolls back only itself, and a panicking job loses only its own
+        // reply. But disk-full, I/O, out-of-memory and busy errors can roll back the whole
+        // transaction, and a job run after that would commit on its own while its caller got an
+        // error. So stop there: the jobs not yet run are dropped, and their callers get errors.
+        let mut finish = Vec::with_capacity(batch.len());
+        for job in batch.drain(..) {
+            if db.is_autocommit() {
+                break;
+            }
+            finish.extend(catch_unwind(AssertUnwindSafe(|| job(&db))).ok());
+        }
         let committed =
             !db.is_autocommit() && db.execute_batch("COMMIT").inspect_err(|e| eprintln!("sqlite: commit: {e}")).is_ok();
         if !db.is_autocommit() {
@@ -320,6 +335,17 @@ pub(crate) mod tests {
         assert!(like.is_err() && post.is_err(), "{like:?} {post:?}");
         assert_eq!(file.rows(), (2, 1));
         assert!(new_post(&db, "next").await.is_ok()); // the writer carries on
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_after_sqlite_rolls_back_the_whole_batch() {
+        let file = TempDb::new();
+        let db = Db::open(file.path()).unwrap();
+        // Disk-full, I/O, out-of-memory and busy errors can roll back the whole transaction; this stands in.
+        let rolls_back = db.write(|db| db.execute_batch("ROLLBACK"));
+        let (rolled_back, post) = in_one_batch(&db, async { tokio::join!(rolls_back, new_post(&db, "after")) }).await;
+        assert!(rolled_back.is_err() && post.is_err());
+        assert_eq!(file.rows(), (2, 1)); // the post was never written, so retrying its 500 can't duplicate it
     }
 
     #[tokio::test]

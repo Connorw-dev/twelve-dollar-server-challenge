@@ -58,7 +58,7 @@ struct Degraded {
 }
 
 async fn health(State(app): AppState) -> Response {
-    match app.db.read(|db| db.query_row("SELECT 1", [], |_| Ok(()))) {
+    match app.db.check() {
         Ok(()) => Json(Healthy { status: "ok", db: "ok", uptime_s: app.started.elapsed().as_secs() }).into_response(),
         Err(e) => {
             let body = Degraded { status: "degraded", db: "unreachable", error: e.to_string() };
@@ -153,6 +153,11 @@ impl IntoResponse for ApiError {
 
 impl From<rusqlite::Error> for ApiError {
     fn from(e: rusqlite::Error) -> Self {
+        // The only foreign key a write can break is its user's: a validly signed token for a user id
+        // that isn't in `users`. Writing an orphan row would leave a post the feed never shows.
+        if e.sqlite_error().is_some_and(|e| e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY) {
+            return ApiError(StatusCode::UNAUTHORIZED, "invalid token payload");
+        }
         eprintln!("database: {e}");
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     }
@@ -305,7 +310,10 @@ mod tests {
         let (app, key, _file) = app();
         let error = |status: u16, message: &str| (status, format!(r#"{{"error":"{message}"}}"#));
         let exp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 60;
+        let no_such_user = bearer(&key, &format!(r#"{{"sub":"999","username":"ghost","exp":{exp}}}"#));
         let cases = [
+            (Some(no_such_user.clone()), "/posts", r#"{"body":"hi"}"#, error(401, "invalid token payload")),
+            (Some(no_such_user), "/posts/1/like", "", error(401, "invalid token payload")),
             (None, "/posts", "{}", error(401, "missing bearer token")),
             (Some("Basic abc".to_owned()), "/posts", "{}", error(401, "missing bearer token")),
             (Some("Bearer abc".to_owned()), "/posts", "{}", error(401, "invalid or expired token")),
